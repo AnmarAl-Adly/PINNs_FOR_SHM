@@ -34,3 +34,6 @@ A series of predefined scenarios are examined in depth. The examination is divid
 |Physics-informed Neural Networks (PINNs)- SN5           |$\mathcal{L}_f + \mathcal{L}_W + \mathcal{L}_m +\mathcal{L}_D$|       ----          |-------|
 
 
+### Questions about code
+
+Email Anmar at aa1224@exeter.ac.uk .
