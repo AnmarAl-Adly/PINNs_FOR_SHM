@@ -5,6 +5,7 @@ Physics-informed neural networks (PINNs), which are a recent development and inc
 
 ## Development of PINNs
 ![alt text](https://github.com/AnmarAl-Adly/PINNs_FOR_SHM/blob/main/fig5.jpg)
+Schematic of Physics-Informed Neural Networks (PINNs).
 ## Synthetic Sensor Data Measurement
 The following table presents a summary of the measured data values and their corresponding locations.
 | Sensor No.     |Coordinates (x, y) m |                                                                   
