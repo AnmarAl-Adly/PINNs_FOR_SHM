@@ -30,7 +30,7 @@ A series of predefined scenarios are examined in depth. The examination is divid
 
 [Go to Cases under different UDLs](CasesunderdifferentUDLs/)
 
-[Go to PINNs Cases](SN5/NEWSN5/)
+[Go to PINNs Cases](SN5/)
 
 | Scenario      |Loss Function  |                                                      Cases         |Sensor No.     |               
 | ------------- | ------------- |                                                      ------------- | ------------- |
