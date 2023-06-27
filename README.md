@@ -30,6 +30,8 @@ A series of predefined scenarios are examined in depth. The examination is divid
 
 [Go to Cases under different UDLs](CasesunderdifferentUDLs/)
 
+[Go to PINNs Cases](SN5/NEWSN5/)
+
 | Scenario      |Loss Function  |                                                      Cases         |Sensor No.     |               
 | ------------- | ------------- |                                                      ------------- | ------------- |
 | Performance of NNs ModeL – SN1           |$\mathcal{L}_D$|                                                     Case 0         |No measured data included|
