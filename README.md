@@ -25,6 +25,7 @@ The following table presents a summary of the measured data values and their cor
 A series of predefined scenarios are examined in depth. The examination is divided into three major case studies.
 ## Case Study 1: 
 The first part of this study evaluates the performance of a model under the conditions of five scenarios. These scenarios are distinguished by the varying number of measurements, ranging from one to nine in each case. For this part of the study, a key structure parameter kept constant throughout is $UDLs$. 
+[Go to the case study 1](Case study_1/SN5/)
 
 ## Case Study 2:
 The second part of the examination takes a different approach. Instead of maintaining $UDLs$ as a constant parameter, it becomes a variable input within NNs. This part aims to comprehend how varying $UDLs$ influence the predictions made by the NNs. This shift towards considering $UDLs$ as inputs rather than constants brings us closer to real-world scenarios where the measured data often obtained under varying and unknown load conditions, increasing the relevance of this section of the study to SHM applications.
