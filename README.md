@@ -30,6 +30,9 @@ The first part of this study evaluates the performance of a model under the cond
 
 ## Case Study 2:
 The second part of the examination takes a different approach. Instead of maintaining $UDLs$ as a constant parameter, it becomes a variable input within NNs. This part aims to comprehend how varying $UDLs$ influence the predictions made by the NNs. This shift towards considering $UDLs$ as inputs rather than constants brings us closer to real-world scenarios where the measured data often obtained under varying and unknown load conditions, increasing the relevance of this section of the study to SHM applications.
+
+[Go to the case study 2](./Case%20study_2)
+
 ## Case Study 3: 
 This case study thus considers two additional layers of complexity, namely semi-rigid connections and data affected by noise. Our aim is to evaluate the adaptability and performance of PINNs in two scenarios: with and without the presence of the PDEs that govern the system
 
