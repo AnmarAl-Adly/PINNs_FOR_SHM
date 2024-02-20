@@ -36,6 +36,7 @@ The second part of the examination takes a different approach. Instead of mainta
 ## Case Study 3: 
 This case study thus considers two additional layers of complexity, namely semi-rigid connections and data affected by noise. Our aim is to evaluate the adaptability and performance of PINNs in two scenarios: with and without the presence of the PDEs that govern the system
 
+[Go to the case study 3](.Case%20study_3/SN4)
 
 
 [Go to Cases under different UDLs](CasesunderdifferentUDLs/)
