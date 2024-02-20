@@ -1,0 +1,1041 @@
+#Case study_3 SN4_30dB
+#Physics-Informed Neural Networks (PINNs) for structural health monitoring: A case study for Kirchhoff-Love Plates
+import os
+import numpy as np
+import seaborn as sns
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from scipy import interpolate
+sns.set_theme(style="whitegrid")
+
+from typing import Tuple, Callable, List, Union
+from tensorflow.experimental.numpy import isclose
+from tensorflow.keras.layers import Input, Dense, Concatenate
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
+from matplotlib.font_manager import FontProperties
+from matplotlib.colors import ListedColormap
+
+# Set the random seed for reproducibility
+np.random.seed(0)
+tf.random.set_seed(0)
+
+def compute_derivatives(x, y, u):
+    """
+    Computes the derivatives of `u` with respect to `x` and `y`.
+
+    Parameters
+    ----------
+    x : tf.Tensor
+        The x-coordinate of the collocation points, of shape (batch_size, 1).
+    y : tf.Tensor
+        The y-coordinate of the collocation points, of shape (batch_size, 1).
+    u : tf.Tensor
+        The prediction made by the PINN, of shape (batch_size, 1).
+
+    Returns
+    -------
+    tuple
+        The derivatives of `u` with respect to `x`, `y`, `xx`, `yy`, `xy`.
+    """
+    dudx, dudy = tf.gradients(u, [x, y])
+    dudxx = tf.gradients(dudx, x)[0]
+    dudyy = tf.gradients(dudy, y)[0]
+    dudxxx, dudxxy = tf.gradients(dudxx, [x, y])
+    dudyyy = tf.gradients(dudyy, y)[0]
+    dudxxxx = tf.gradients(dudxxx, x)[0]
+    dudxxyy = tf.gradients(dudxxy, y)[0]
+    dudyyyy = tf.gradients(dudyyy, y)[0]
+    return dudxx, dudyy
+
+
+def compute_moments(D, nue, dudxx, dudyy):
+    """
+    Computes the moments along the x and y axes.
+
+    Parameters
+    ----------
+    D : float
+        The flexural stiffness.
+    nue : float
+        Poisson's ratio.
+    dudxx : tf.Tensor
+        The second-order derivative of `u` with respect to `x`, of shape (batch_size, 1).
+    dudyy : tf.Tensor
+        The second-order derivative of `u` with respect to `y`, of shape (batch_size, 1).
+
+    Returns
+    -------
+    tuple
+        The moments along the x and y axes.
+    """
+    mx = -D * (dudxx + nue * dudyy)
+    my = -D * (nue * dudxx + dudyy)
+    return mx, my
+
+EPS = 1e-7
+
+class Kirchhoffplate:
+    """
+    Class representing a Kirchhoff plate, providing several methods for training a Physics-Informed Neural Network.
+    """
+    def __init__(self, p: Callable[[tf.Tensor, tf.Tensor], tf.Tensor], T: float, nue: float, E: float, H: float, W: float):
+        """
+        Initialize the Kirchhoffplate class.
+
+        PARAMETERS
+        ----------------
+        p : Callable[[tf.Tensor, tf.Tensor], tf.Tensor]
+            The load function, taking x and y coordinates as inputs and returning the load.
+        T : float
+            Thickness of the plate.
+        nue : float
+            Poisson's ratio.
+        E : float
+            Young's modulus.
+        W : float
+            Width of the plate.
+        H : float
+            Height of the plate.
+        """
+        self.p = p
+        self.T = T
+        self.nue = nue
+        self.E = E
+        self.D = (E * T**3) / (12 * (1 - nue**2)) # flexural stiffnes of the plate
+        self.H = H
+        self.W = W
+        self.num_terms = 3
+
+    def training_batch(self, batch_size_domain:int=800, batch_size_boundary:int=100) -> Tuple[tf.Tensor, tf.Tensor]:
+        """
+        PARAMETERS
+        --------------------
+        batch_size_domain : int
+            number of points to be sampled inside of the domain
+        batch_size_boundary : int
+            number of points to be sampled on each of the four boundaries
+        mu : float
+            mean of the Gaussian distribution
+        sigma : float
+            standard deviation of the Gaussian distribution
+        """
+        # Set mean and standard deviation for Gaussian distribution
+        mu_x = self.W / 2.0  # Midpoint of the width
+        mu_y = self.H / 2.0  # Midpoint of the height
+        sigma = 0.3 # Smaller value will make points concentrate more in the middle
+
+         # Sample from Gaussian distribution centered at the middle of the domain
+        x_in = tf.random.normal(shape=(200, 1), mean=mu_x, stddev=sigma)
+        y_in = tf.random.normal(shape=(200, 1), mean=mu_y, stddev=sigma)
+
+        # Clip to make sure points lie inside the domain
+        x_in = tf.clip_by_value(x_in, 0, self.W)
+        y_in = tf.clip_by_value(y_in, 0, self.H)
+
+        # The rest of your code remains the same
+        x_in1 = tf.random.uniform(shape=(batch_size_domain, 1), minval=0, maxval=self.W)
+        x_b1 = tf.zeros(shape=(batch_size_boundary, 1))
+        x_b2 = tf.zeros(shape=(batch_size_boundary, 1)) + self.W
+        x_b3 = tf.random.uniform(shape=(batch_size_boundary, 1), minval=0, maxval=self.W)
+        x_b4 = tf.random.uniform(shape=(batch_size_boundary, 1), minval=0, maxval=self.W)
+        x_m = tf.constant([0, 4, 1, 3, 2, 2, 2, 1, 3, 1, 3, 0, 4], shape=(13,1), dtype= tf.float32)
+        x = tf.concat([x_in1, x_b1, x_b2, x_b3, x_b4, x_m], axis=0)
+
+        y_in1 = tf.random.uniform(shape=(batch_size_domain, 1), minval=0, maxval=self.W)
+        y_b1 = tf.random.uniform(shape=(batch_size_boundary, 1), minval=0, maxval=self.H)
+        y_b2 = tf.random.uniform(shape=(batch_size_boundary, 1), minval=0, maxval=self.H)
+        y_b3 = tf.zeros(shape=(batch_size_boundary, 1))
+        y_b4 = tf.zeros(shape=(batch_size_boundary, 1)) + self.H
+        y_m = tf.constant([0, 0, 1, 1, 1, 3, 2, 2, 2, 3, 3, 4, 4], shape=(13,1), dtype= tf.float32)
+        y = tf.concat([ y_in1, y_b1, y_b2, y_b3, y_b4, y_m], axis=0)
+
+        return x, y
+
+    def get_train_dataset(self, batch_size_domain:int=800, batch_size_boundary:int=100):
+        """
+        Creates a tf.data.Dataset generator for training.
+
+        Parameters
+        ----------
+        batch_size_domain : int
+            number of points to be sampled inside of the domain. Default is 800.
+        batch_size_boundary : int
+            number of points to be sampled on each of the four boundaries. Default is 100.
+
+        Returns
+        -------
+        tf.data.Dataset
+            A `tf.data.Dataset` generator for training.
+        """
+        def generator():
+            while True:
+                xy = tf.concat(self.training_batch(batch_size_domain, batch_size_boundary), axis=-1)
+                yield xy, xy
+
+        return tf.data.Dataset.from_generator(
+            generator,
+            output_types=(tf.float32, tf.float32),
+            output_shapes=((None, 2), (None, 2))
+        )
+
+
+    def get_validation_dataset(self, batch_size_domain:int=200, batch_size_boundary:int=25):
+
+      def generator():
+        while True:
+            xy = tf.concat(self.training_batch(batch_size_domain, batch_size_boundary), axis=-1)
+            yield xy, xy
+
+      return tf.data.Dataset.from_generator(
+        generator,
+        output_types=(tf.float32, tf.float32),
+        output_shapes=((None, 2), (None, 2))
+    )
+
+    def compute_loss(self, x, y, preds):
+        """
+        Computes the physics-informed loss for Kirchhoff's plate bending equation.
+       """
+        u = preds[:, 0:1]
+        dudxx = preds[:, 1:2]
+        dudyy = preds[:, 2:3]
+
+
+                # determine which points are on the boundaries of the domain
+        # if a point is on either of the boundaries, its value is 1 and 0 otherwise
+        x_lower = tf.cast(isclose(x, 0.     , rtol=0., atol=EPS), dtype=tf.float32)
+        x_upper = tf.cast(isclose(x, self.W, rtol=0., atol=EPS), dtype=tf.float32)
+        y_lower = tf.cast(isclose(y, 0.     , rtol=0., atol=EPS), dtype=tf.float32)
+        y_upper = tf.cast(isclose(y, self.H, rtol=0., atol=EPS), dtype=tf.float32)
+
+        # compute 0th order boundary condition loss
+        L_w = ((x_lower + x_upper + y_lower + y_upper) * u)**2
+        # compute 2nd order boundary condition loss
+        mx, my = compute_moments(self.D, self.nue, dudxx, dudyy)
+        L_m = ((x_lower + x_upper + y_lower + y_upper) * mx)**2 + ((x_lower + x_upper + y_lower + y_upper) * my)**2
+
+        u_d =tf.constant([ 0.00284369, -0.00213244,  0.20261822,  0.18532728,  0.25684643,
+         0.26633902,  0.36529004,  0.25232693,  0.25734909,  0.184826  ,
+         0.17926468, -0.00132042, -0.00231264], shape=(13,1), dtype=tf.float32 )*1e-3
+
+        # Calculate the indices for the last rows
+        batch_size = tf.shape(preds)[0]
+        indices = tf.range(batch_size - 13, batch_size, dtype=tf.int32)
+
+        # Extract the corresponding predictions
+        selected_preds = tf.gather(preds[:, 0:1], indices)
+
+        # Compute the new loss term L_u
+        L_u_partial = (u_d - selected_preds)**2
+
+        # Create a tensor of zeros with the same shape as the existing loss terms
+        L_u_full = tf.zeros_like(preds[:, :1])
+
+        # Replace the last five elements with the values from L_u_partial
+        L_D = tf.tensor_scatter_nd_update(L_u_full, tf.expand_dims(indices, axis=1), L_u_partial)
+
+
+        return L_w, L_m , L_D
+class KirchhoffLoss(tf.keras.losses.Loss):
+    """
+    Kirchhoff Loss for plate bending physics-informed neural network.
+    Parameters
+    ----------
+    plate: Kirchhoffplate
+        The Kirchhoffplate object representing the plate bending physics.
+    name: str, optional
+        The name of the custom loss.
+    """
+    def __init__(self, plate: Kirchhoffplate, name: str = "kirchhoff_loss"):
+        super().__init__(name=name)
+        self.plate = plate
+        #self.weight_L_f = tf.Variable(1.0, trainable=True, constraint=lambda x: tf.clip_by_value(x, 0, 1))
+        self.weight_L_w = tf.Variable(1.0, trainable=True, constraint=lambda x: tf.clip_by_value(x, 0, 1))
+        self.weight_L_m = tf.Variable(1.0, trainable=True, constraint=lambda x: tf.clip_by_value(x, 0, 1))
+        self.weight_L_D = tf.Variable(10.0, trainable=True, constraint=lambda x: tf.clip_by_value(x, 0, 1))
+
+    def call(self, xy, preds):
+      x, y = xy[:, :1], xy[:, 1:]
+      L_w, L_m, L_D = self.plate.compute_loss(x, y, preds)
+    # Approach 2: Scale L_D
+      scaled_L_D = 10* tf.reduce_mean(L_D)
+
+     # Update weights (this remains the same)
+      weights_sum = self.weight_L_w + self.weight_L_m + self.weight_L_D
+      #self.weight_L_f.assign(self.weight_L_f / weights_sum)
+      self.weight_L_w.assign(self.weight_L_w / weights_sum)
+      self.weight_L_m.assign(self.weight_L_m / weights_sum)
+      self.weight_L_D.assign(self.weight_L_D / weights_sum)
+
+    # Compute the loss
+      loss = self.weight_L_w * tf.reduce_mean(L_w) + \
+           self.weight_L_m * tf.reduce_mean(L_m)  + \
+           self.weight_L_D * scaled_L_D  # use scaled_L_D here
+
+      return loss
+class KirchhoffMetric(tf.keras.metrics.Metric):
+    """
+    Kirchhoff metric to log the values of each loss term, i.e. L_f, L_w and L_d.
+    """
+    def __init__(self, plate: Kirchhoffplate, name='kirchhoff_metric', **kwargs):
+        """Initialize Kirchhoff metric with a Kirchhoffplate instance and metric name.
+
+        Parameters
+        ----------
+        plate : Kirchhoffplate
+            Instance of the Kirchhoffplate.
+        name : str, optional
+            Name of the metric. Defaults to 'kirchhoff_metric'.
+        """
+        super().__init__(name=name, **kwargs)
+        self.plate = plate
+        #self.L_f_mean = self.add_weight(name='L_f_mean', initializer='zeros')
+        self.L_w_mean = self.add_weight(name='L_w_mean', initializer='zeros')
+        self.L_m_mean = self.add_weight(name='L_m_mean', initializer='zeros')
+        self.L_D_mean = self.add_weight(name='L_D_mean', initializer='zeros')
+
+    def update_state(self, xy, y_pred, sample_weight=None):
+        x, y = xy[:, :1], xy[:, 1:]
+        L_w, L_m, L_D= self.plate.compute_loss(x, y, y_pred)
+        #self.L_f_mean.assign(tf.reduce_mean(L_f[:, 0], axis=0))
+        self.L_w_mean.assign(tf.reduce_mean(L_w[:, 0], axis=0))
+        self.L_m_mean.assign(tf.reduce_mean(L_m[:, 0], axis=0))
+        self.L_D_mean.assign(tf.reduce_mean(L_D[:, 0], axis=0))
+    def reset_state(self):
+        #self.L_f_mean.assign(0)
+        self.L_w_mean.assign(0)
+        self.L_m_mean.assign(0)
+        self.L_D_mean.assign(0)
+    def result(self):
+        return {'L_w': self.L_w_mean, 'L_m': self.L_m_mean, 'L_D': self.L_D_mean}
+
+class KirchhoffPINN(tf.keras.Model):
+    """
+   This class is a implementation of a  neural network
+    for the Kirchhoff plate bending.
+    """
+    def __init__(self, layer_widths: List[int]=[64, 64, 64, 64], activation: Union[str, Callable]='tanh', **kwargs):
+        """
+        Parameters
+        ----------
+        layer_widths : List[int], optional
+            List of integers representing the widths of the hidden layers in the model.
+        activation : Union[str, Callable], optional
+            Activation function to be applied in each layer.
+        """
+        super().__init__(**kwargs)
+        self.layer_sequence = [tf.keras.layers.Dense(width, activation=activation, kernel_initializer='glorot_normal') for width in layer_widths]
+        self.layer_sequence.append(tf.keras.layers.Dense(1, kernel_initializer='glorot_normal'))
+
+    def call(self, xy, training=None, mask=None):
+        x, y = xy[:, :1], xy[:, 1:]
+
+        u = Concatenate()([x, y])
+        for layer in self.layer_sequence:
+            u = layer(u)
+
+        dudxx, dudyy = compute_derivatives(x, y, u)
+
+        return tf.concat([u, dudxx, dudyy], axis=-1)
+    
+W = 4
+H = 4
+T = 0.2
+E = 31724
+nue = 0.2
+p0 = 0.00948
+D = (E * T**3) / (12 * (1 - nue**2)) # flexural stiffnes of the plate
+
+load = lambda x, y: p0 + (x-x)*(y-y)
+plate = Kirchhoffplate(p = load, T=T, nue=nue, E=E, W=W, H=H)
+# Set the random seed for reproducibility
+np.random.seed(0)
+tf.random.set_seed(0)
+x, y = plate.training_batch()
+
+# Create a scatter plot of the load p over the plate
+plt.scatter(x, y)
+plt.xlabel('x (m)')
+plt.ylabel('y (m)')
+plt.title('Collocation Points')
+plt.show()
+
+#print(p)
+#print(x)
+#print(y)
+
+pinn = KirchhoffPINN()
+loss = KirchhoffLoss(plate)
+pinn.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005), loss=loss, metrics=[KirchhoffMetric(plate), 'accuracy'])
+
+from tensorflow.keras.callbacks import ModelCheckpoint
+
+# Create validation dataset
+val_dataset = plate.get_validation_dataset()
+
+# Initialize the ModelCheckpoint callback
+checkpoint_callback = ModelCheckpoint(
+    filepath='/mnt/data/best_model.h5',
+    monitor='val_loss',
+    verbose=1,
+    save_best_only=True,
+    save_weights_only=True
+)
+
+# Training the model
+h = pinn.fit(
+    plate.get_train_dataset(),
+    validation_data=val_dataset,
+    epochs=20000,
+    steps_per_epoch=50,
+    validation_steps=10,
+    callbacks=[
+        ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=50, min_delta=0, verbose=True),
+        EarlyStopping(monitor='val_loss', patience=200, restore_best_weights=True, verbose=True),
+        checkpoint_callback  # Adding the ModelCheckpoint callback
+    ],
+)
+loss_keys = ['L_w', 'L_m', 'L_D']
+new_labels = {'L_w': 'w', 'L_m': 'm', 'L_D': 'D'}
+
+# Specify the color for each line
+colors = ['red', 'green', 'orange', 'blue']
+cmap = ListedColormap(colors)
+
+# Compute percentage contribution of each loss to total loss
+percentage_contributions = {}
+for key in loss_keys:
+    # Avoid division by zero
+    h.history['loss'] = np.where(np.array(h.history['loss']) == 0, np.finfo(float).eps, h.history['loss'])
+    percentage_contributions[key] = 100 * np.log(np.array(h.history[key])) / np.log(np.array(h.history['loss']))
+
+# Plotting
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5), dpi=50)
+
+for i, key in enumerate(loss_keys):
+    ax1.plot(percentage_contributions[key], label='$\u2112_{' + new_labels[key].replace('_', '-') + '}$', color=cmap(i))
+
+ax1.set_xlabel('Epochs', fontweight='bold')
+ax1.set_ylabel('% Loss Components Contribution', fontweight='bold')
+ax1.legend(prop=FontProperties(weight='bold'))
+ax1.grid(False)
+ax1.text(0.02, 1.1, '(a)', transform=ax1.transAxes, fontsize=12, fontweight='bold', va='top', ha='left')
+#ax1.tick_params(axis='both', which='both', labelweight='bold')
+
+# Summarize history for loss
+tloss = np.log(h.history['loss'])
+# Setting "Times New Roman" as the default font
+plt.rc('font', family='Liberation Serif')
+ax2.plot(tloss, label='Total Loss', color='darkblue')
+ax2.set_xlabel('Epochs', fontweight='bold')
+ax2.set_ylabel('Log $L_2$ loss', fontweight='bold')
+ax2.legend()
+ax2.grid(False)
+ax2.text(0.02, 1.1, '(b)', transform=ax2.transAxes, fontsize=12, fontweight='bold', va='top', ha='left')
+#ax2.tick_params(axis='both', which='both', labelweight='bold')
+
+# Adjust spacing between subplots
+plt.subplots_adjust(wspace=0.3)
+
+plt.tight_layout()
+plt.savefig('kirchhoff_total_loss')
+plt.show()
+
+import matplotlib.pyplot as plt
+
+# Access the history object's attributes to get the loss and val_loss data
+loss = h.history['loss']
+val_loss = h.history['val_loss']
+
+# Create the plot
+plt.figure(figsize=(10, 6))
+plt.plot(loss, label='Training Loss')
+plt.plot(val_loss, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training and Validation Loss')
+plt.legend()
+plt.show()
+
+x = np.array([0, 4, 1, 3, 2, 2, 2, 1, 3, 1, 3, 0, 4], dtype=np.float32).reshape((13, 1))
+y = np.array([0, 0, 1, 1, 1, 3, 2, 2, 2, 3, 3, 4, 4], dtype=np.float32).reshape((13, 1))
+
+# Create a meshgrid of x, y data
+X, Y = np.meshgrid(x, y)
+input_data = np.column_stack((X.flatten(), Y.flatten()))
+
+# Predict the model for the new x, y data
+predictions = pinn.predict(input_data)
+
+x_values = [0, 4, 1, 3, 2, 2, 2, 1, 3, 1, 3, 0, 4]
+y_values = [0, 0, 1, 1, 1, 3, 2, 2, 2, 3, 3, 4, 4]
+
+pred_values = []
+for x, y in zip(x_values, y_values):
+    index = np.where((input_data[:, 0] == x) & (input_data[:, 1] == y))[0][0]
+    value = predictions[index, 2]
+    #value = predictions
+    pred_values.append(value)
+
+print(pred_values)
+
+x = np.array([0, 4, 0, 2, 1, 3, 2, 2, 2.0, 2, 2.0, 1, 3, 1, 3, 2, 4, 0, 4], dtype=np.float32).reshape((19, 1))
+y = np.array([0, 0, 2, 0, 1, 1, 1, 3, 1.5, 2, 2.5, 2, 2, 3, 3, 4, 2, 4, 4], dtype=np.float32).reshape((19, 1))
+
+# Create a meshgrid of x, y data
+X, Y = np.meshgrid(x, y)
+input_data = np.column_stack((X.flatten(), Y.flatten()))
+
+# Predict the model for the new x, y data
+predictions = pinn.predict(input_data)
+
+x_values = [0, 4, 0, 2, 1, 3, 2, 2, 2.0, 2, 2.0, 1, 3, 1, 3, 2, 4, 0, 4]
+y_values = [0, 0, 2, 0, 1, 1, 1, 3, 1.5, 2, 2.5, 2, 2, 3, 3, 4, 2, 4, 4]
+
+pred_values = []
+for x, y in zip(x_values, y_values):
+    index = np.where((input_data[:, 0] == x) & (input_data[:, 1] == y))[0][0]
+    value = predictions[index, 1]
+    #value = predictions
+    pred_values.append(value)
+
+print(pred_values)
+
+dudxx =[4.0429004e-06, -8.8108936e-07, -0.00016612346, -5.986198e-05, -0.00013718224, -0.00013621937, -0.00020256499, -0.0002182608, -9.9074154e-05, -0.00014361838, -9.0678746e-05, 1.3602257e-06, 5.791895e-06]
+
+dudyy =[1.2998971e-06, 3.8533472e-07, -0.00012282853, -7.979083e-05, -0.00013706298, -0.0001454886, -0.00022241194, -0.00017242518, -0.00013648055, -0.000103252416, -0.00011444453, 4.9034134e-07, 4.406378e-06]
+
+
+mx = [-D * (x + nue * y) for x, y in zip(dudxx, dudyy)]
+my = [-D * (nue * x + y) for x, y in zip(dudxx, dudyy)]
+
+mx_rounded = [round(value, 6) for value in mx]
+my_rounded = [round(value, 6) for value in my]
+
+print("mx =", mx_rounded)
+print("my =", my_rounded)
+
+
+mx_real = tf.constant([262.03,262.03, 1597.9, 548, 3353, 3353, 4289,
+                       3604, 5040, 5321, 5049, 4758.5, 4758.5, 3353, 3353,  548, 1597.9, 262.03, 262.03], shape=(19, 1), dtype=tf.float32)
+#Reshape  my into a 2D array of shape (3, 3)
+mx_pred =tf.constant([3.4e-05, -6.9e-05, -1.5e-05, -2.3e-05, 0.003298, 0.002446, 0.00463, 0.004093, 0.006012, 0.006305, 0.005578, 0.004336, 0.003559, 0.002868, 0.002405, 1.7e-05, -2e-05, -3.4e-05, -2.3e-05]
+, shape=(19,1), dtype=tf.float32)*1000000
+
+# Compute the element-wise squared difference between  my and my_real
+mx_sq_error = tf.square(mx_pred - mx_real)
+# Define x and y axis
+x = tf.constant([0, 4, 0, 2, 1, 3, 2, 2, 2.0, 2, 2.0, 1, 3, 1, 3, 2, 4, 0, 4], shape=(19, 1), dtype=tf.float32)
+y = tf.constant([0, 0, 2, 0, 1, 1, 1, 3, 1.5, 2, 2.5, 2, 2, 3, 3, 4, 2, 4, 4], shape=(19, 1), dtype=tf.float32)
+
+# Convert x and y tensors to numpy arrays
+x = x.numpy()
+y = y.numpy()
+mx_pred = mx_pred.numpy().flatten()
+mx_real = mx_real.numpy().flatten()
+mx_sq_error = mx_sq_error.numpy().flatten()
+# Create a meshgrid of x and y coordinates for contour plot
+X, Y = np.meshgrid(np.linspace(x.min(), x.max(), 150), np.linspace(y.min(), y.max(), 150))
+
+# Interpolate my and my_real values to the meshgrid points
+mx_pred_interp = interpolate.griddata((x.flatten(), y.flatten()), mx_pred, (X, Y), method='cubic')
+mx_real_interp = interpolate.griddata((x.flatten(), y.flatten()), mx_real, (X, Y), method='cubic')
+mx_sq_error_interp =interpolate.griddata((x.flatten(), y.flatten()), mx_sq_error, (X, Y), method='cubic')
+
+# Plot mx, mx_real, and the contour plot of squared error
+fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+im0 = axs[0].imshow(mx_pred_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb0 = fig.colorbar(im0, ax=axs[0], shrink=0.85)
+#axs[0].set_title('mx_predicted moment')
+#axs[0].set_xlabel('x [m]')
+#axs[0].set_ylabel('y [m]')
+axs[0].set_xticks(np.arange(0, 0.01, 1))
+axs[0].set_yticks(np.arange(0, 0.01, 1))
+#axs[0].set_xticks(np.arange(x.min(), x.max(), x.max()))
+#axs[0].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+im1 = axs[1].imshow(mx_real_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb1 = fig.colorbar(im1, ax=axs[1], shrink=0.85)
+#axs[1].set_title('mx_measured moment')
+#axs[1].set_xlabel('x [m]')
+#axs[1].set_ylabel('y [m]')
+#axs[1].set_xticks(np.arange(0.00, 0.01, 1))
+#axs[1].set_yticks(np.arange(0.00, 0.01, 1))
+axs[1].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[1].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+#im2 = axs[2].contourf(X, Y, sq_error_interp, cmap='jet', levels=20, aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+im2 = axs[2].imshow(mx_sq_error_interp, cmap='jet', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb2 = fig.colorbar(im2, ax=axs[2], shrink=0.85)
+axs[2].set_title('Squared Error')
+axs[2].set_xlabel('x [m]')
+axs[2].set_ylabel('y [m]')
+axs[2].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[2].set_yticks(np.arange(y.min(), y.max(), y.max()))
+plt.show()
+
+max_sq_error = np.max(mx_sq_error)
+print("Maximum squared error:", max_sq_error)
+rmse = np.sqrt(np.mean(mx_sq_error))
+print("Root Mean Squared Error (RMSE):", rmse)
+mx_cv_rmse = (rmse / tf.reduce_mean(mx_real)) * 100
+print("CV(RMSE) (mx)):", mx_cv_rmse.numpy(), '%')
+
+nmbe = np.sum(mx_real - mx_pred) / np.sum(mx_real) * 100
+print("Normalized Mean Bias Error (NMBE):", nmbe, '%')
+
+my_real = tf.constant([-181.72, -181.72, 1363, -1268, 3297, 3297, 4289,
+                       4289, 5481,  5878.1,  5481, 5084, 5084, 3297, 3297, -1268, 1363, -181.72, -181.72], shape=(19, 1), dtype=tf.float32)
+#Reshape  my into a 2D array of shape (3, 3)
+my_pred =tf.constant([-0.000176, -0.000103, -6.4e-05, -6.3e-05, 0.004038, 0.004241, 0.005585, 0.004636, 0.006201, 0.006259, 0.005825, 0.00478, 0.004357, 0.003581, 0.003305, 7e-06, 7.7e-05, -0.000124, -0.000136]
+, shape=(19,1), dtype=tf.float32)*1e6
+
+
+# Compute the element-wise squared difference between  my and my_real
+my_sq_error = tf.square(my_pred - my_real)
+# Define x and y axis
+x = tf.constant([0, 4, 0, 2, 1, 3, 2, 2, 2.0, 2, 2.0, 1, 3, 1, 3, 2, 4, 0, 4], shape=(19, 1), dtype=tf.float32)
+y = tf.constant([0, 0, 2, 0, 1, 1, 1, 3, 1.5, 2, 2.5, 2, 2, 3, 3, 4, 2, 4, 4], shape=(19, 1), dtype=tf.float32)
+
+
+# Convert x and y tensors to numpy arrays
+x = x.numpy()
+y = y.numpy()
+my_pred = my_pred.numpy().flatten()
+my_real = my_real.numpy().flatten()
+my_sq_error = my_sq_error.numpy().flatten()
+# Create a meshgrid of x and y coordinates for contour plot
+X, Y = np.meshgrid(np.linspace(x.min(), x.max(), 150), np.linspace(y.min(), y.max(), 150))
+
+# Interpolate my and my_real values to the meshgrid points
+my_pred_interp = interpolate.griddata((x.flatten(), y.flatten()), my_pred, (X, Y), method='cubic')
+my_real_interp = interpolate.griddata((x.flatten(), y.flatten()), my_real, (X, Y), method='cubic')
+my_sq_error_interp =interpolate.griddata((x.flatten(), y.flatten()), my_sq_error, (X, Y), method='cubic')
+
+# Plot mx, mx_real, and the contour plot of squared error
+fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+im0 = axs[0].imshow(my_pred_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb0 = fig.colorbar(im0, ax=axs[0], shrink=0.85)
+axs[0].set_title('my_predicted moment')
+axs[0].set_xlabel('x [m]')
+axs[0].set_ylabel('y [m]')
+axs[0].set_xticks(np.arange(0, 0.01, 1))
+axs[0].set_yticks(np.arange(0, 0.01, 1))
+#axs[0].set_xticks(np.arange(x.min(), x.max(), x.max()))
+#axs[0].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+im1 = axs[1].imshow(my_real_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb1 = fig.colorbar(im1, ax=axs[1], shrink=0.85)
+axs[1].set_title('my_measured moment')
+axs[1].set_xlabel('x [m]')
+axs[1].set_ylabel('y [m]')
+#axs[1].set_xticks(np.arange(0.00, 0.01, 1))
+#axs[1].set_yticks(np.arange(0.00, 0.01, 1))
+axs[1].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[1].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+#im2 = axs[2].contourf(X, Y, sq_error_interp, cmap='jet', levels=20, aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+im2 = axs[2].imshow(my_sq_error_interp, cmap='jet', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb2 = fig.colorbar(im2, ax=axs[2], shrink=0.85)
+axs[2].set_title('Squared Error')
+axs[2].set_xlabel('x [m]')
+axs[2].set_ylabel('y [m]')
+axs[2].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[2].set_yticks(np.arange(y.min(), y.max(), y.max()))
+plt.show()
+
+max_sq_error = np.max(my_sq_error)
+print("Maximum squared error:", max_sq_error)
+rmse = np.sqrt(np.mean(my_sq_error))
+print("Root Mean Squared Error (RMSE):", rmse)
+my_cv_rmse = (rmse / tf.reduce_mean(my_real)) * 100
+print("CV(RMSE)  (my):", my_cv_rmse.numpy(), '%')
+
+nmbe = np.sum(my_real - my_pred) / np.sum(my_real) * 100
+print("Normalized Mean Bias Error (NMBE):", nmbe, '%')
+
+# Define u_real as a 2D array of shape (150, 150)
+u_real=tf.constant([0.00000000, 0.00000000, 1.86952e-4, 1.86952e-4, 2.5614e-4, 2.5614e-4, 3.7115e-4,
+                         2.5614e-4,  2.5614e-4, 1.86952e-4, 1.86952e-4, 0.00000000, 0.00000000], shape=(13,1), dtype=tf.float32 )*1000
+u_pred =tf.constant([5.6120916e-06, 1.4004239e-05, 0.00020011229, 0.00016139535, 0.00024767307, 0.0002490384, 0.0003521414, 0.00027587352, 0.00023247389, 0.00018993852, 0.0001739235, 2.73576e-09, 1.1936703e-05]
+, shape=(13,1), dtype=tf.float32)*1000
+# Compute the element-wise squared difference between u_pred and u_real
+sq_error = tf.square(u_pred - u_real)
+# Define x and y axis
+x = tf.constant([0, 4, 1, 3, 2, 2, 2, 1, 3, 1, 3, 0, 4], shape=(13, 1), dtype=tf.float32)
+y = tf.constant([0, 0, 1, 1, 1, 3, 2, 2, 2, 3, 3, 4, 4], shape=(13, 1), dtype=tf.float32)
+# Convert x and y tensors to numpy arrays
+x = x.numpy()
+y = y.numpy()
+u_pred = u_pred.numpy().flatten()
+u_real = u_real.numpy().flatten()
+sq_error = sq_error.numpy().flatten()
+# Create a meshgrid of x and y coordinates for contour plot
+X, Y = np.meshgrid(np.linspace(x.min(), x.max(), 150), np.linspace(y.min(), y.max(), 150))
+
+# Interpolate u_pred and u_real values to the meshgrid points
+u_pred_interp = interpolate.griddata((x.flatten(), y.flatten()), u_pred, (X, Y), method='cubic')
+u_real_interp = interpolate.griddata((x.flatten(), y.flatten()), u_real, (X, Y), method='cubic')
+sq_error_interp =interpolate.griddata((x.flatten(), y.flatten()), sq_error, (X, Y), method='cubic')
+
+# Plot u_pred, u_real, and the contour plot of squared error
+fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+im0 = axs[0].imshow(u_pred_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb0 = fig.colorbar(im0, ax=axs[0], shrink=0.85, ticks=np.linspace(u_pred_interp.min(), u_pred_interp.max(), 5))
+#axs[0].set_title('Predicted Deformation')
+#axs[0].set_xlabel('x [m]')
+#axs[0].set_ylabel('y [m]')
+axs[0].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[0].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+im1 = axs[1].imshow(u_real_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb1 = fig.colorbar(im1, ax=axs[1], shrink=0.85, ticks=np.linspace(u_real_interp.min(), u_real_interp.max(), 5))
+axs[1].set_title('Real Deformation')
+axs[1].set_xlabel('x [m]')
+#axs[1].set_ylabel('y [m]')
+axs[1].set_xticks(np.arange(x.min(), x.max(), x.max()))
+#axs[1].set_xticks(np.arange(x.min(), x.max()))
+axs[1].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+#im2 = axs[2].contourf(X, Y, sq_error_interp, cmap='jet', levels=20, aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+im2 = axs[2].imshow(sq_error_interp, cmap='jet', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb2 = fig.colorbar(im2, ax=axs[2], shrink=0.85)
+axs[2].set_title('Squared Error')
+axs[2].set_xlabel('x [m]')
+#axs[2].set_ylabel('y [m]')
+axs[2].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[2].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+plt.show()
+
+max_sq_error = np.max(sq_error)
+print("Maximum squared error:", max_sq_error)
+rmse = np.sqrt(np.mean(sq_error))
+print("Root Mean Squared Error (RMSE):", rmse)
+u_cv_rmse = (rmse / tf.reduce_mean(u_real)) * 100
+print("CV(RMSE) for Deformation (u):", u_cv_rmse.numpy(), '%')
+nmbe = np.sum(u_real - u_pred) / np.sum(u_real) * 100
+print("Normalized Mean Bias Error (NMBE):", nmbe, '%')
+
+import matplotlib.pyplot as plt
+from scipy import interpolate
+import tensorflow as tf
+import numpy as np
+
+# Function to add noise with a given SNR
+def add_noise_with_snr(u_real, snr_db):
+    signal_power = np.mean(u_real ** 2)
+    snr_linear = 10 ** (snr_db / 10.0)
+    noise_power = signal_power / snr_linear
+    noise_stddev = np.sqrt(noise_power)
+    noise = np.random.normal(0, noise_stddev, u_real.shape)
+    return u_real + noise
+
+# Define u_real and u_pred
+u_real = np.array([0.00000000, 0.00000000, 0.00024037, 0.00024035, 0.00033146,
+                   0.00033144, 0.00045886, 0.00033147, 0.00033144, 0.00024036,
+                   0.00024034, 0.00000000, 0.00000000]) * 1000
+u_pred = np.array([5.1403185e-07, -5.245267e-06, 0.00022620702, 0.00022555137,
+                   0.00031125167, 0.00030709425, 0.00042801158, 0.00031175645,
+                   0.00030835712, 0.0002258587, 0.00021952012, -3.3379183e-06,
+                   -2.4140463e-06]) * 1000
+
+# Generate noisy signals for different SNRs
+snrs = [10, 20, 30, 40]
+u_noisy_signals = [add_noise_with_snr(u_real, snr) for snr in snrs]
+
+# Define x and y axis
+x = np.array([0, 4, 1, 3, 2, 2, 2, 1, 3, 1, 3, 0, 4]).reshape((13, 1))
+y = np.array([0, 0, 1, 1, 1, 3, 2, 2, 2, 3, 3, 4, 4]).reshape((13, 1))
+
+# Create a meshgrid of x and y coordinates for contour plot
+X, Y = np.meshgrid(np.linspace(x.min(), x.max(), 150), np.linspace(y.min(), y.max(), 150))
+
+# Plot u_pred, u_real, and the noisy signals for different SNRs
+fig, axs = plt.subplots(1, len(snrs) + 2, figsize=(18, 5))
+
+# Plot u_pred
+im0 = axs[0].imshow(interpolate.griddata((x.flatten(), y.flatten()), u_pred, (X, Y), method='cubic'),
+                    cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+fig.colorbar(im0, ax=axs[0], shrink=0.85)
+axs[0].set_title('Predicted Displacement')
+
+# Plot u_real
+im1 = axs[1].imshow(interpolate.griddata((x.flatten(), y.flatten()), u_real, (X, Y), method='cubic'),
+                    cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+fig.colorbar(im1, ax=axs[1], shrink=0.85)
+axs[1].set_title('Real Displacement')
+
+# Plot noisy signals for different SNRs
+for i, (snr, u_noisy) in enumerate(zip(snrs, u_noisy_signals)):
+    im = axs[i+2].imshow(interpolate.griddata((x.flatten(), y.flatten()), u_noisy, (X, Y), method='cubic'),
+                         cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+    fig.colorbar(im, ax=axs[i+2], shrink=0.85)
+    axs[i+2].set_title(f'Noisy Signal (SNR = {snr} dB)')
+
+plt.show()
+
+from scipy import interpolate
+import matplotlib.pyplot as plt
+import numpy as np
+import tensorflow as tf
+
+# Define u_real as a 2D array of shape (13, 1)
+u_real = np.array([0.00000000, 0.00000000, 1.86952e-4, 1.86952e-4, 2.5614e-4, 2.5614e-4, 3.7115e-4,
+                         2.5614e-4,  2.5614e-4, 1.86952e-4, 1.86952e-4, 0.00000000, 0.00000000]) * 1000
+
+# Define x and y axis
+x = np.array([0, 4, 1, 3, 2, 2, 2, 1, 3, 1, 3, 0, 4])
+y = np.array([0, 0, 1, 1, 1, 3, 2, 2, 2, 3, 3, 4, 4])
+
+# Create a meshgrid of x and y coordinates for contour plot
+X, Y = np.meshgrid(np.linspace(x.min(), x.max(), 150), np.linspace(y.min(), y.max(), 150))
+## Initialize a dictionary to store the noisy measurement values for different SNRs
+noisy_values_dict = {}
+
+
+fig, axs = plt.subplots(2, 2, figsize=(18, 10), dpi= 600)
+
+# Iterate through SNR values [10, 20, 30, 40]
+for idx, snr_db in enumerate([10, 20, 30, 40]):
+    # Calculate the power of the signal
+    signal_power = np.mean(u_real ** 2)
+
+    # Convert SNR from dB to linear scale
+    snr_linear = 10 ** (snr_db / 10.0)
+
+    # Calculate the noise power
+    noise_power = signal_power / snr_linear
+
+    # Generate the Gaussian noise with zero mean and calculated noise power
+    noise_stddev = np.sqrt(noise_power)
+    np.random.seed(5)
+    noise = np.random.normal(0, noise_stddev, u_real.shape)
+
+    # Add noise to the signal
+    u_noisy = u_real + noise
+    # Store the noisy measurement in the dictionary
+    noisy_values_dict[f"SNR_{snr_db}dB"] = u_noisy
+    # Interpolate u_noisy values to the meshgrid points
+    u_noisy_interp = interpolate.griddata((x.flatten(), y.flatten()), u_noisy, (X, Y), method='cubic')
+
+    # Plot noisy measurements for each SNR value
+    row, col = divmod(idx, 2)
+    im = axs[row, col].imshow(u_noisy_interp, cmap='jet', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+    cb = fig.colorbar(im, ax=axs[row, col], shrink=1)
+    axs[row, col].set_title(f'SNR = {snr_db} dB')
+    axs[row, col].set_xlabel('x [m]')
+    axs[row, col].set_ylabel('y [m]')
+    axs[row, col].set_xticks(np.arange(x.min(), x.max() + 1, 1))
+    axs[row, col].set_yticks(np.arange(y.min(), y.max() + 1, 1))
+
+plt.tight_layout()
+plt.show()
+noisy_values_dict
+
+dudxx= [-2.3688335e-06, 2.900255e-06, -0.00012398162, -8.818321e-05, -0.00017479528, -0.00015974452, -0.00023976341, -0.0001642356, -0.00012984907, -0.00011142541, -9.090791e-05, 1.8381979e-06, 3.4447294e-07]
+
+dudyy =[4.1644453e-06, 1.0686927e-06, -0.0001285004, -0.00011423812, -0.0001767592, -0.00013017445, -0.00023214123, -0.00016282499, -0.00015838724, -9.371643e-05, -9.123038e-05, -1.4032703e-06, 3.5611447e-06]
+
+mx = [-D * (x + nue * y) for x, y in zip(dudxx, dudyy)]
+my = [-D * (nue * x + y) for x, y in zip(dudxx, dudyy)]
+
+mx_rounded = [round(value, 6) for value in mx]
+my_rounded = [round(value, 6) for value in my]
+
+print("mx =", mx_rounded)
+print("my =", my_rounded)
+
+
+mx_real = tf.constant([262, 262, 3084, 3084, 4289,
+                       3604, 5321, 4422, 4422, 2393, 3084, 262, 262], shape=(13, 1), dtype=tf.float32)
+#Reshape  my into a 2D array of shape (3, 3)
+mx_pred =tf.constant([-9.5e-05, 1.8e-05, 0.004201, 0.00167, 0.003626, 0.003642, 0.005443, 0.005568, 0.002784, 0.003619, 0.002502, -3.2e-05, -0.000147], shape=(13,1), dtype=tf.float32)*1000000
+
+# Compute the element-wise squared difference between  my and my_real
+mx_sq_error = tf.square(mx_pred - mx_real)
+# Define x and y axis
+x = tf.constant([0, 4, 1, 3, 2, 2, 2, 1, 3, 1, 3, 0, 4], shape=(13, 1), dtype=tf.float32)
+y = tf.constant([0, 0, 1, 1, 1, 3, 2, 2, 2, 3, 3, 4, 4], shape=(13, 1), dtype=tf.float32)
+
+# Convert x and y tensors to numpy arrays
+x = x.numpy()
+y = y.numpy()
+mx_pred = mx_pred.numpy().flatten()
+mx_real = mx_real.numpy().flatten()
+mx_sq_error = mx_sq_error.numpy().flatten()
+# Create a meshgrid of x and y coordinates for contour plot
+X, Y = np.meshgrid(np.linspace(x.min(), x.max(), 150), np.linspace(y.min(), y.max(), 150))
+
+# Interpolate my and my_real values to the meshgrid points
+mx_pred_interp = interpolate.griddata((x.flatten(), y.flatten()), mx_pred, (X, Y), method='cubic')
+mx_real_interp = interpolate.griddata((x.flatten(), y.flatten()), mx_real, (X, Y), method='cubic')
+mx_sq_error_interp =interpolate.griddata((x.flatten(), y.flatten()), mx_sq_error, (X, Y), method='cubic')
+
+# Plot mx, mx_real, and the contour plot of squared error
+fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+im0 = axs[0].imshow(mx_pred_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb0 = fig.colorbar(im0, ax=axs[0], shrink=0.85)
+#axs[0].set_title('mx_predicted moment')
+#axs[0].set_xlabel('x [m]')
+#axs[0].set_ylabel('y [m]')
+axs[0].set_xticks(np.arange(0, 0.01, 1))
+axs[0].set_yticks(np.arange(0, 0.01, 1))
+#axs[0].set_xticks(np.arange(x.min(), x.max(), x.max()))
+#axs[0].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+im1 = axs[1].imshow(mx_real_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb1 = fig.colorbar(im1, ax=axs[1], shrink=0.85)
+axs[1].set_title('mx_measured moment')
+axs[1].set_xlabel('x [m]')
+axs[1].set_ylabel('y [m]')
+#axs[1].set_xticks(np.arange(0.00, 0.01, 1))
+#axs[1].set_yticks(np.arange(0.00, 0.01, 1))
+axs[1].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[1].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+#im2 = axs[2].contourf(X, Y, sq_error_interp, cmap='jet', levels=20, aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+im2 = axs[2].imshow(mx_sq_error_interp, cmap='jet', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb2 = fig.colorbar(im2, ax=axs[2], shrink=0.85)
+axs[2].set_title('Squared Error')
+axs[2].set_xlabel('x [m]')
+axs[2].set_ylabel('y [m]')
+axs[2].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[2].set_yticks(np.arange(y.min(), y.max(), y.max()))
+plt.show()
+
+max_sq_error = np.max(mx_sq_error)
+print("Maximum squared error:", max_sq_error)
+rmse = np.sqrt(np.mean(mx_sq_error))
+print("Root Mean Squared Error (RMSE):", rmse)
+mx_cv_rmse = (rmse / tf.reduce_mean(mx_real)) * 100
+print("CV(RMSE) for mx:", mx_cv_rmse.numpy(), '%')
+
+nmbe = np.sum(mx_real - mx_pred) / np.sum(mx_real) * 100
+print("Normalized Mean Bias Error (NMBE):", nmbe, '%')
+
+my_real = tf.constant([-181.72, -181.72, 2945, 2945, 5239,
+                       3902, 5878, 4306, 4306, 2159, 2945, -181.72, -181.72], shape=(13, 1), dtype=tf.float32)
+#Reshape  my into a 2D array of shape (3, 3)
+my_pred =tf.constant([-4.6e-05, -5e-06, 0.003438, 0.002022, 0.003624, 0.003805, 0.005792, 0.00476, 0.003443, 0.002908, 0.002921, -1.7e-05, -0.000123], shape=(13,1), dtype=tf.float32)*1e6
+
+
+# Compute the element-wise squared difference between  my and my_real
+my_sq_error = tf.square(my_pred - my_real)
+# Define x and y axis
+x = tf.constant([0, 4, 1, 3, 2, 2, 2, 1, 3, 1, 3, 0, 4], shape=(13, 1), dtype=tf.float32)
+y = tf.constant([0, 0, 1, 1, 1, 3, 2, 2, 2, 3, 3, 4, 4], shape=(13, 1), dtype=tf.float32)
+
+# Convert x and y tensors to numpy arrays
+x = x.numpy()
+y = y.numpy()
+my_pred = my_pred.numpy().flatten()
+my_real = my_real.numpy().flatten()
+my_sq_error = my_sq_error.numpy().flatten()
+# Create a meshgrid of x and y coordinates for contour plot
+X, Y = np.meshgrid(np.linspace(x.min(), x.max(), 150), np.linspace(y.min(), y.max(), 150))
+
+# Interpolate my and my_real values to the meshgrid points
+my_pred_interp = interpolate.griddata((x.flatten(), y.flatten()), my_pred, (X, Y), method='cubic')
+my_real_interp = interpolate.griddata((x.flatten(), y.flatten()), my_real, (X, Y), method='cubic')
+my_sq_error_interp =interpolate.griddata((x.flatten(), y.flatten()), my_sq_error, (X, Y), method='cubic')
+
+# Plot mx, mx_real, and the contour plot of squared error
+fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+im0 = axs[0].imshow(my_pred_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb0 = fig.colorbar(im0, ax=axs[0], shrink=0.85)
+axs[0].set_title('my_predicted moment')
+axs[0].set_xlabel('x [m]')
+axs[0].set_ylabel('y [m]')
+axs[0].set_xticks(np.arange(0, 0.01, 1))
+axs[0].set_yticks(np.arange(0, 0.01, 1))
+#axs[0].set_xticks(np.arange(x.min(), x.max(), x.max()))
+#axs[0].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+im1 = axs[1].imshow(my_real_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb1 = fig.colorbar(im1, ax=axs[1], shrink=0.85)
+axs[1].set_title('mx_measured moment')
+axs[1].set_xlabel('x [m]')
+axs[1].set_ylabel('y [m]')
+#axs[1].set_xticks(np.arange(0.00, 0.01, 1))
+#axs[1].set_yticks(np.arange(0.00, 0.01, 1))
+axs[1].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[1].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+#im2 = axs[2].contourf(X, Y, sq_error_interp, cmap='jet', levels=20, aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+im2 = axs[2].imshow(my_sq_error_interp, cmap='jet', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb2 = fig.colorbar(im2, ax=axs[2], shrink=0.85)
+axs[2].set_title('Squared Error')
+axs[2].set_xlabel('x [m]')
+axs[2].set_ylabel('y [m]')
+axs[2].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[2].set_yticks(np.arange(y.min(), y.max(), y.max()))
+plt.show()
+
+max_sq_error = np.max(my_sq_error)
+print("Maximum squared error:", max_sq_error)
+rmse = np.sqrt(np.mean(my_sq_error))
+print("Root Mean Squared Error (RMSE):", rmse)
+my_cv_rmse = (rmse / tf.reduce_mean(my_real)) * 100
+print("CV(RMSE) for my:", my_cv_rmse.numpy(), '%')
+
+nmbe = np.sum(my_real - my_pred) / np.sum(my_real) * 100
+print("Normalized Mean Bias Error (NMBE):", nmbe, '%')
+
+# Define u_real and u_pred as 2D arrays
+u_real = tf.constant([0.00000000, 0.00000000, 0.00024037, 0.00024035,0.00033146, 0.00033144, 0.00045886,
+                     0.00033147, 0.00033144, 0.00024036, 0.00024034, 0.00000000, 0.00000000], shape=(13,1), dtype=tf.float32 )
+u_pred = tf.constant([-4.278263e-08, -1.7223647e-07, 0.00022998924, 0.00022442179, 0.00031509536, 0.00031332957, 0.0004383801,
+                     0.00031908887, 0.00030943291, 0.00022968563, 0.00022375869, 1.18336175e-07, -7.794588e-07], shape=(13,1), dtype=tf.float32)
+
+# Compute the element-wise squared difference between u_pred and u_real
+sq_error = tf.square(u_pred - u_real)
+
+# Define x and y axis
+x = tf.constant([0, 4, 1, 3, 2, 2, 2, 1, 3, 1, 3, 0, 4], shape=(13, 1), dtype=tf.float32)
+y = tf.constant([0, 0, 1, 1, 1, 3, 2, 2, 2, 3, 3, 4, 4], shape=(13, 1), dtype=tf.float32)
+
+# Convert x and y tensors to numpy arrays
+x = x.numpy()
+y = y.numpy()
+u_pred = u_pred.numpy().flatten()
+u_real = u_real.numpy().flatten()
+sq_error = sq_error.numpy().flatten()
+
+# Create a meshgrid of x and y coordinates for contour plot
+X, Y = np.meshgrid(np.linspace(x.min(), x.max(), 150), np.linspace(y.min(), y.max(), 150))
+
+# Interpolate u_pred, u_real, and sq_error values to the meshgrid points
+u_pred_interp = interpolate.griddata((x.flatten(), y.flatten()), u_pred, (X, Y), method='cubic')
+u_real_interp = interpolate.griddata((x.flatten(), y.flatten()), u_real, (X, Y), method='cubic')
+sq_error_interp = interpolate.griddata((x.flatten(), y.flatten()), sq_error, (X, Y), method='cubic')
+
+# Plot u_pred, u_real, and the contour plot of squared error
+fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+im0 = axs[0].imshow(u_pred_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb0 = fig.colorbar(im0, ax=axs[0], shrink=0.85, ticks=np.linspace(u_pred_interp.min(), u_pred_interp.max(), 5))
+axs[0].set_title('Predicted Deformation')
+axs[0].set_xlabel('x [m]')
+axs[0].set_ylabel('y [m]')
+axs[0].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[0].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+im1 = axs[1].imshow(u_real_interp, cmap='jet', origin='lower', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb1 = fig.colorbar(im1, ax=axs[1], shrink=0.85, ticks=np.linspace(u_real_interp.min(), u_real_interp.max(), 5))
+axs[1].set_title('Real Deformation')
+axs[1].set_xlabel('x [m]')
+axs[1].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[1].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+im2 = axs[2].imshow(sq_error_interp, cmap='jet', aspect='equal', extent=[x.min(), x.max(), y.min(), y.max()])
+cb2 = fig.colorbar(im2, ax=axs[2], shrink=0.85)
+axs[2].set_title('Squared Error')
+axs[2].set_xlabel('x [m]')
+axs[2].set_xticks(np.arange(x.min(), x.max(), x.max()))
+axs[2].set_yticks(np.arange(y.min(), y.max(), y.max()))
+
+plt.show()
+
+# Compute RMSE
+rmse = np.sqrt(np.mean(sq_error))
+print("Root Mean Squared Error (RMSE):", rmse)
