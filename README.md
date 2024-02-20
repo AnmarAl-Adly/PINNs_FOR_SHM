@@ -41,6 +41,8 @@ This case study thus considers two additional layers of complexity, namely semi-
 ![alt text](https://github.com/AnmarAl-Adly/PINNs_FOR_SHM/blob/main/SNR.png)
 Effect of SNR on the quality of deflection 𝑤noise data.
 
+Table 1. Summary of the loss function scenarios and cases employed in the study.
+
 | Scenario      |Loss Function  |                                                      Cases         |Sensor No.     |               
 | ------------- | ------------- |                                                      ------------- | ------------- |
 | Performance of NNs ModeL – SN1           |$\mathcal{L}_D$|                                                     Case 0         |No measured data included|
