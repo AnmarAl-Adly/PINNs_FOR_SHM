@@ -25,6 +25,7 @@ The following table presents a summary of the measured data values and their cor
 A series of predefined scenarios are examined in depth. The examination is divided into three major case studies.
 ## Case Study 1: 
 The first part of this study evaluates the performance of a model under the conditions of five scenarios. These scenarios are distinguished by the varying number of measurements, ranging from one to nine in each case. For this part of the study, a key structure parameter kept constant throughout is $UDLs$. 
+
 [Go to the case study 1](./Case%20study_1/SN5)
 
 ## Case Study 2:
