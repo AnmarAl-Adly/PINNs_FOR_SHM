@@ -52,7 +52,7 @@ Effect of SNR on the quality of deflection 𝑤noise data.
 
 ### Questions about the study
 
-Email Anmar at aa1224@exeter.ac.uk .
+Email Anmar Al-Adly at aa1224@exeter.ac.uk .
 
 ## License
 
