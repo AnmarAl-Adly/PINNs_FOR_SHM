@@ -38,6 +38,8 @@ This case study thus considers two additional layers of complexity, namely semi-
 
 [Go to the case study 3](.Case%20study_3/SN4)
 
+![alt text](https://github.com/AnmarAl-Adly/PINNs_FOR_SHM/blob/main/SNR.png)
+Effect of SNR on the quality of deflection 𝑤noise data.
 
 | Scenario      |Loss Function  |                                                      Cases         |Sensor No.     |               
 | ------------- | ------------- |                                                      ------------- | ------------- |
