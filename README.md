@@ -49,3 +49,7 @@ This case study thus considers two additional layers of complexity, namely semi-
 ### Questions about code
 
 Email Anmar at aa1224@exeter.ac.uk .
+
+## License
+
+This work is licensed under a [Creative Commons Attribution 4.0 International License](https://creativecommons.org/licenses/by/4.0/).
