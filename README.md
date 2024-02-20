@@ -48,7 +48,7 @@ This case study thus considers two additional layers of complexity, namely semi-
 |Physics-informed Neural Networks (PINNs)- SN5           |$\mathcal{L}_f + \mathcal{L}_W + \mathcal{L}_m +\mathcal{L}_D$|       ----          |-------|
 
 
-### Questions about code
+### Questions about the study
 
 Email Anmar at aa1224@exeter.ac.uk .
 
